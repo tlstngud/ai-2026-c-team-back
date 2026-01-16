@@ -1,0 +1,52 @@
+{
+  "architectures": [
+    "VideoSwinTransformer"
+  ],
+  "model_type": "video-swin-transformer",
+  "backbone": "swin3d_t",
+  "pretrained_source": "kinetics400",
+  "num_classes": 5,
+  "class_names": [
+    "정상",
+    "졸음운전",
+    "물건찾기",
+    "휴대폰 사용",
+    "운전자 폭행"
+  ],
+  "input_size": {
+    "frames": 30,
+    "height": 224,
+    "width": 224,
+    "channels": 3
+  },
+  "input_format": "CTHW",
+  "training": {
+    "epochs_trained": 1,
+    "total_epochs": 5,
+    "batch_size": 16,
+    "effective_batch_size": 128,
+    "learning_rate": 0.001,
+    "optimizer": "AdamW",
+    "scheduler": "OneCycleLR",
+    "mixed_precision": true,
+    "gradient_accumulation_steps": 4
+  },
+  "metrics": {
+    "accuracy": 0.9551,
+    "macro_f1": 0.9436,
+    "per_class_f1": {
+      "정상": 0.92,
+      "졸음운전": 0.98,
+      "물건찾기": 0.92,
+      "휴대폰 사용": 0.9,
+      "운전자 폭행": 1.0
+    }
+  },
+  "dataset": {
+    "name": "Korean Driver Behavior Dataset",
+    "total_samples": 1371062,
+    "num_videos": 243979,
+    "sliding_window": 30,
+    "stride": 15
+  }
+}

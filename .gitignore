@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Model weights (too large for GitHub - download separately)
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Database
+*.db
+*.sqlite
+
+# Logs
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
