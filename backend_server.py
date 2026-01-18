@@ -71,12 +71,37 @@ main_event_loop = None
 user_sessions: Dict[str, Dict] = {}
 sessions_lock = threading.Lock()
 
-# 배치 추론 설정 (GPU 최적화 - Video Swin Transformer 메모리 고려)
-BATCH_SIZE = 16  # 8 -> 16 (처리량 2배 증가, OOM 방지)
-FRAMES_PER_INFERENCE = 30
-FRAME_BUFFER_SIZE = 60  # 버퍼 크기 (60프레임 모으고)
-FRAME_SHIFT = 10  # 추론 후 시프트량 (10프레임씩 이동 = 33% 새 데이터)
-BATCH_TIMEOUT = 0.1  # 50ms -> 100ms (배치 채우기 시간 증가)
+# 배치 추론 설정 (동적 배치 - 저지연 + 처리량 균형)
+MIN_BATCH_SIZE = 1   # 최소 배치 (저지연 우선, ~47ms)
+MAX_BATCH_SIZE = 8   # 최대 배치 (다중 사용자 처리량)
+BATCH_SIZE = MAX_BATCH_SIZE  # GPU 워밍업용 (실제 런타임은 동적)
+FRAMES_PER_INFERENCE = 30  # 추론에 사용할 프레임 수
+FRAME_BUFFER_SIZE = 30  # 버퍼 크기 (30프레임 = 최신 0.5초 유지)
+BATCH_TIMEOUT = 0.01  # 10ms (저지연 응답)
+
+# 동적 추론 빈도 설정 (사용자 수에 따라 조절)
+# 빈도가 낮아지면 경고 판단 횟수도 비례해서 감소 (1초 = 경고 판단 완료 유지)
+FRAME_SHIFT_CONFIG = {
+    1: {"shift": 3, "alert_threshold": 20, "interval_ms": 50},    # 1명: 50ms, 20회=1초
+    2: {"shift": 6, "alert_threshold": 10, "interval_ms": 100},   # 2명: 100ms, 10회=1초
+    3: {"shift": 9, "alert_threshold": 7, "interval_ms": 150},    # 3명: 150ms, 7회=1초
+    4: {"shift": 12, "alert_threshold": 5, "interval_ms": 200},   # 4명+: 200ms, 5회=1초
+}
+
+def get_dynamic_frame_shift():
+    """활성 세션 수에 따라 동적 FRAME_SHIFT 반환"""
+    with sessions_lock:
+        active_count = len([s for s in user_sessions.values()
+                           if time.time() - s.get('last_active', 0) < 30])
+
+    if active_count <= 1:
+        return FRAME_SHIFT_CONFIG[1]
+    elif active_count <= 2:
+        return FRAME_SHIFT_CONFIG[2]
+    elif active_count <= 3:
+        return FRAME_SHIFT_CONFIG[3]
+    else:
+        return FRAME_SHIFT_CONFIG[4]
 
 # 추론 큐 (즉시 처리용)
 @dataclass
@@ -411,8 +436,8 @@ def run_batch_inference(jobs: List[InferenceJob]) -> List[Dict[str, Any]]:
 
 # GPU 상시 대기 배치 워커
 def gpu_batch_worker():
-    """GPU에서 상시 대기하며 요청 즉시 배치 처리"""
-    print("GPU batch worker started - waiting for requests...", flush=True)
+    """GPU에서 상시 대기하며 동적 배치 처리 (저지연 + 처리량 균형)"""
+    print("GPU batch worker started - dynamic batching enabled...", flush=True)
 
     while True:
         jobs = []
@@ -422,12 +447,24 @@ def gpu_batch_worker():
         try:
             first_job = inference_queue.get(timeout=1.0)
             jobs.append(first_job)
-            print(f"📥 Got first job for session {first_job.session_id[:8]}, queue size now: {inference_queue.qsize()}", flush=True)
+            queue_size = inference_queue.qsize()
+            print(f"📥 Got first job for session {first_job.session_id[:8]}, queue size: {queue_size}", flush=True)
         except Empty:
             continue  # 타임아웃, 다시 대기
 
-        # 배치 채우기 (BATCH_TIMEOUT 내에 더 모으기)
-        while len(jobs) < BATCH_SIZE:
+        # 동적 배치 크기 결정 (큐 상태 기반)
+        queue_size = inference_queue.qsize()
+        if queue_size >= 20:
+            target_batch = MAX_BATCH_SIZE  # 부하 높음 → 처리량 우선
+        elif queue_size >= 10:
+            target_batch = 4
+        elif queue_size >= 3:
+            target_batch = 2
+        else:
+            target_batch = MIN_BATCH_SIZE  # 부하 낮음 → 저지연 우선
+
+        # 배치 채우기 (BATCH_TIMEOUT 내에 target까지 모으기)
+        while len(jobs) < target_batch:
             elapsed = time.time() - start_time
             remaining = BATCH_TIMEOUT - elapsed
 
@@ -449,9 +486,10 @@ def gpu_batch_worker():
                 inference_time = (time.time() - inference_start) * 1000
                 print(f"✅ Batch inference complete in {inference_time:.0f}ms", flush=True)
 
-                # 추론 결과 로그 출력
+                # 추론 결과 로그 출력 (전체 지연 포함)
                 for i, result in enumerate(results):
-                    print(f"🎯 추론결과 [{jobs[i].session_id[:8]}] {result['class_name']} ({result['confidence']:.1f}%) | 배치:{len(jobs)} | {inference_time:.0f}ms")
+                    total_latency = (time.time() - jobs[i].timestamp) * 1000
+                    print(f"🎯 추론결과 [{jobs[i].session_id[:8]}] {result['class_name']} ({result['confidence']:.1f}%) | 배치:{len(jobs)} | 추론:{inference_time:.0f}ms | 총지연:{total_latency:.0f}ms")
 
                 # ===== 최적화: 디버그 저장 비동기 처리 (추론 블로킹 방지) =====
                 if SAVE_DEBUG_FRAMES:
@@ -489,14 +527,23 @@ def gpu_batch_worker():
                     # 비동기 실행 (추론 스레드 블로킹 없음)
                     debug_executor.submit(save_debug_frames_async, jobs.copy(), results.copy(), inference_time)
 
-                # 결과 전송
+                # 결과 전송 (동적 설정 포함)
                 for i, job in enumerate(jobs):
+                    # 세션의 현재 설정 가져오기
+                    config = FRAME_SHIFT_CONFIG[1]  # 기본값
+                    with sessions_lock:
+                        if job.session_id in user_sessions:
+                            config = user_sessions[job.session_id].get('config', config)
+
                     result_data = {
                         "status": "inference_complete",
                         "session_id": job.session_id,
                         "result": results[i],
                         "batch_size": len(jobs),
-                        "latency_ms": round((time.time() - job.timestamp) * 1000, 1)
+                        "latency_ms": round((time.time() - job.timestamp) * 1000, 1),
+                        # 동적 설정 전달 (프론트엔드 경고 판단용)
+                        "alert_threshold": config["alert_threshold"],
+                        "interval_ms": config["interval_ms"]
                     }
 
                     # WebSocket으로 전송 (메인 이벤트 루프 사용)
@@ -529,24 +576,30 @@ def gpu_batch_worker():
 
 # 프레임 수집 및 큐 추가
 def add_frame_to_session(session_id: str, frame: np.ndarray, websocket=None):
-    """프레임 추가 및 60프레임 버퍼에서 최신 30프레임으로 추론"""
+    """프레임 추가 및 동적 빈도로 추론 (사용자 수 기반)"""
+    # 동적 설정 가져오기 (락 밖에서 호출)
+    config = get_dynamic_frame_shift()
+    frame_shift = config["shift"]
+
     with sessions_lock:
         if session_id not in user_sessions:
             user_sessions[session_id] = {
                 'frames': [],
                 'last_active': time.time(),
-                'websocket': websocket
+                'websocket': websocket,
+                'config': config  # 현재 설정 저장
             }
 
         session = user_sessions[session_id]
         session['frames'].append(frame)
         session['last_active'] = time.time()
+        session['config'] = config  # 설정 업데이트
         if websocket:
             session['websocket'] = websocket
 
         buffer_size = len(session['frames'])
 
-        # 60프레임 버퍼가 차면 최신 30프레임으로 추론
+        # 버퍼가 차면 최신 30프레임으로 추론
         if buffer_size >= FRAME_BUFFER_SIZE:
             job = InferenceJob(
                 session_id=session_id,
@@ -556,19 +609,21 @@ def add_frame_to_session(session_id: str, frame: np.ndarray, websocket=None):
             )
             inference_queue.put(job)
 
-            # 10프레임 시프트 (추론당 33% 새 데이터)
-            session['frames'] = session['frames'][FRAME_SHIFT:]
+            # 동적 시프트 (사용자 수에 따라 조절)
+            session['frames'] = session['frames'][frame_shift:]
 
             return {
                 "status": "queued",
                 "buffer_size": len(session['frames']),
-                "queue_size": inference_queue.qsize()
+                "queue_size": inference_queue.qsize(),
+                "config": config  # 클라이언트에 설정 전달
             }
 
         return {
             "status": "buffering",
             "buffer_size": buffer_size,
-            "frames_needed": FRAMES_PER_INFERENCE - buffer_size
+            "frames_needed": FRAMES_PER_INFERENCE - buffer_size,
+            "config": config
         }
 
 @app.on_event("startup")
