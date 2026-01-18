@@ -103,6 +103,10 @@ def get_dynamic_frame_shift():
     else:
         return FRAME_SHIFT_CONFIG[4]
 
+# 프레임 신뢰성 설정
+FRAME_STALE_THRESHOLD = 15  # 연속 15프레임 동일하면 "stale" 판정
+FRAME_HASH_SAMPLE_SIZE = 1000  # 해시 샘플 크기 (속도 최적화)
+
 # 추론 큐 (즉시 처리용)
 @dataclass
 class InferenceJob:
@@ -110,6 +114,8 @@ class InferenceJob:
     frames: List[np.ndarray]
     websocket: Optional[any] = None
     timestamp: float = 0.0
+    frame_reliability: str = "good"  # "good", "stale", "frozen"
+    same_frame_count: int = 0
 
 inference_queue: Queue = Queue()
 results_store: Dict[str, Dict] = {}  # HTTP 폴링용 결과 저장
@@ -194,8 +200,15 @@ def load_model():
     global model, compiled_model, device, preallocated_buffer, gpu_mean, gpu_std
     global inference_stream, transfer_stream, pinned_buffer
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    # ===== GPU 전용 모드 강제 =====
+    if not torch.cuda.is_available():
+        print("❌ CUDA GPU 필수. CPU 모드는 지원하지 않습니다.")
+        print("💡 GPU 서버에서 실행하거나 CUDA 환경을 설정해주세요.")
+        raise RuntimeError("GPU not available. This server requires CUDA GPU.")
+
+    device = torch.device('cuda')
+    print(f"✅ Using device: {device}")
+    print(f"📊 GPU: {torch.cuda.get_device_name(0)}")
 
     # ===== 최적화 1: cuDNN 벤치마크 활성화 =====
     if torch.cuda.is_available():
@@ -368,6 +381,25 @@ def run_batch_inference(jobs: List[InferenceJob]) -> List[Dict[str, Any]]:
         return []
 
     batch_size = len(jobs)
+
+    # ===== GPU 메모리 부족 시 대기 로직 =====
+    for retry in range(5):
+        try:
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            free = total - allocated
+
+            if free < 0.5:  # 500MB 미만이면 대기
+                print(f"⚠️ GPU 메모리 부족 ({free:.2f}GB 남음), 정리 중... ({retry+1}/5)")
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                time.sleep(0.5)
+            else:
+                break
+        except Exception as mem_error:
+            print(f"❌ GPU 메모리 체크 오류: {mem_error}")
+            if retry < 4:
+                time.sleep(0.5)
 
     # ===== 최적화: NumPy 연산 벡터화 =====
     # 모든 프레임을 한 번에 스택 (리스트 컴프리헨션 대신)
@@ -543,7 +575,10 @@ def gpu_batch_worker():
                         "latency_ms": round((time.time() - job.timestamp) * 1000, 1),
                         # 동적 설정 전달 (프론트엔드 경고 판단용)
                         "alert_threshold": config["alert_threshold"],
-                        "interval_ms": config["interval_ms"]
+                        "interval_ms": config["interval_ms"],
+                        # 프레임 신뢰성 정보 (프론트엔드 경고용)
+                        "frame_reliability": job.frame_reliability,
+                        "same_frame_count": job.same_frame_count
                     }
 
                     # WebSocket으로 전송 (메인 이벤트 루프 사용)
@@ -574,12 +609,32 @@ def gpu_batch_worker():
                 print(f"❌ Batch inference error: {e}", flush=True)
                 traceback.print_exc()
 
+def compute_frame_hash(frame: np.ndarray) -> str:
+    """프레임 해시 계산 (빠른 비교용) - 여러 위치 샘플링"""
+    try:
+        flat = frame.flatten()
+        length = len(flat)
+        # 여러 위치에서 샘플링하여 해시 생성
+        samples = [
+            flat[length // 4: length // 4 + 100],      # 25% 위치
+            flat[length // 2: length // 2 + 100],      # 50% 위치
+            flat[-100:]                                  # 끝 부분
+        ]
+        combined = np.concatenate(samples)
+        return hash(combined.tobytes())
+    except Exception:
+        return hash(time.time())  # 실패 시 고유 해시
+
+
 # 프레임 수집 및 큐 추가
 def add_frame_to_session(session_id: str, frame: np.ndarray, websocket=None):
-    """프레임 추가 및 동적 빈도로 추론 (사용자 수 기반)"""
+    """프레임 추가 및 동적 빈도로 추론 (사용자 수 기반) + 프레임 신뢰성 검증"""
     # 동적 설정 가져오기 (락 밖에서 호출)
     config = get_dynamic_frame_shift()
     frame_shift = config["shift"]
+
+    # 프레임 해시 계산 (락 밖에서)
+    current_hash = compute_frame_hash(frame)
 
     with sessions_lock:
         if session_id not in user_sessions:
@@ -587,15 +642,44 @@ def add_frame_to_session(session_id: str, frame: np.ndarray, websocket=None):
                 'frames': [],
                 'last_active': time.time(),
                 'websocket': websocket,
-                'config': config  # 현재 설정 저장
+                'config': config,
+                'last_frame_hash': None,
+                'same_frame_count': 0,
+                'total_stale_count': 0
             }
 
         session = user_sessions[session_id]
         session['frames'].append(frame)
         session['last_active'] = time.time()
-        session['config'] = config  # 설정 업데이트
+        session['config'] = config
         if websocket:
             session['websocket'] = websocket
+
+        # ===== 프레임 변화 감지 =====
+        last_hash = session.get('last_frame_hash')
+        if last_hash is not None and current_hash == last_hash:
+            session['same_frame_count'] = session.get('same_frame_count', 0) + 1
+        else:
+            # 변화 감지 시 카운터 리셋
+            if session.get('same_frame_count', 0) > 5:
+                print(f"✅ [{session_id[:8]}] 프레임 변화 감지 ({session['same_frame_count']}회 동일 후)")
+            session['same_frame_count'] = 0
+
+        session['last_frame_hash'] = current_hash
+
+        # 신뢰성 판정
+        same_count = session.get('same_frame_count', 0)
+        if same_count >= FRAME_STALE_THRESHOLD * 2:  # 30회 이상: frozen
+            frame_reliability = "frozen"
+            if same_count % 30 == 0:
+                print(f"🔴 [{session_id[:8]}] 프레임 FROZEN! ({same_count}회 연속 동일)")
+                session['total_stale_count'] = session.get('total_stale_count', 0) + 1
+        elif same_count >= FRAME_STALE_THRESHOLD:  # 15회 이상: stale
+            frame_reliability = "stale"
+            if same_count % 15 == 0:
+                print(f"🟡 [{session_id[:8]}] 프레임 STALE ({same_count}회 연속 동일)")
+        else:
+            frame_reliability = "good"
 
         buffer_size = len(session['frames'])
 
@@ -603,9 +687,11 @@ def add_frame_to_session(session_id: str, frame: np.ndarray, websocket=None):
         if buffer_size >= FRAME_BUFFER_SIZE:
             job = InferenceJob(
                 session_id=session_id,
-                frames=session['frames'][-FRAMES_PER_INFERENCE:],  # 최신 30프레임
+                frames=session['frames'][-FRAMES_PER_INFERENCE:],
                 websocket=session.get('websocket'),
-                timestamp=time.time()
+                timestamp=time.time(),
+                frame_reliability=frame_reliability,
+                same_frame_count=same_count
             )
             inference_queue.put(job)
 
@@ -616,14 +702,18 @@ def add_frame_to_session(session_id: str, frame: np.ndarray, websocket=None):
                 "status": "queued",
                 "buffer_size": len(session['frames']),
                 "queue_size": inference_queue.qsize(),
-                "config": config  # 클라이언트에 설정 전달
+                "config": config,
+                "frame_reliability": frame_reliability,
+                "same_frame_count": same_count
             }
 
         return {
             "status": "buffering",
             "buffer_size": buffer_size,
             "frames_needed": FRAMES_PER_INFERENCE - buffer_size,
-            "config": config
+            "config": config,
+            "frame_reliability": frame_reliability,
+            "same_frame_count": same_count
         }
 
 @app.on_event("startup")
@@ -1076,7 +1166,17 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         ping_task.cancel()
         with sessions_lock:
             if session_id in user_sessions:
-                user_sessions[session_id]['websocket'] = None
+                # 세션 완전 삭제 (프레임 버퍼 메모리 해제)
+                session = user_sessions[session_id]
+                frame_count = len(session.get('frames', []))
+                session['frames'].clear()  # 명시적 프레임 버퍼 정리
+                del user_sessions[session_id]
+                print(f"🧹 세션 삭제 [{session_id[:8]}]: {frame_count}프레임 해제")
+
+            # 결과 저장소에서도 삭제
+            if session_id in results_store:
+                del results_store[session_id]
+
         print(f"🔚 WebSocket cleanup done: {session_id[:8]}")
 
 # 세션 정리
