@@ -26,9 +26,9 @@ from io import BytesIO
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, AsyncGenerator
 import uvicorn
 import threading
 from queue import Queue, Empty
@@ -1091,6 +1091,88 @@ async def get_result(session_id: str):
         return results_store.pop(session_id)
     return {"status": "pending"}
 
+
+# ===== SSE (Server-Sent Events) 엔드포인트 =====
+
+async def sse_event_generator(session_id: str) -> AsyncGenerator[str, None]:
+    """SSE 이벤트 스트림 생성기 - WebSocket 대안"""
+    print(f"📡 SSE stream started: {session_id[:8]}")
+
+    with sessions_lock:
+        if session_id not in user_sessions:
+            user_sessions[session_id] = {
+                'frames': [],
+                'last_active': time.time(),
+                'sse_active': True
+            }
+        else:
+            user_sessions[session_id]['sse_active'] = True
+
+    last_sent_time = time.time()
+    try:
+        while True:
+            current_time = time.time()
+
+            # 세션 활성 상태 확인
+            with sessions_lock:
+                if session_id not in user_sessions:
+                    break
+                if not user_sessions[session_id].get('sse_active', False):
+                    break
+                user_sessions[session_id]['last_active'] = current_time
+
+            # 결과가 있으면 전송
+            if session_id in results_store:
+                result = results_store.pop(session_id)
+                data = json.dumps(result, ensure_ascii=False)
+                yield f"event: inference\ndata: {data}\n\n"
+                last_sent_time = current_time
+                print(f"📤 SSE result sent [{session_id[:8]}]")
+
+            # Keep-alive ping (15초마다)
+            elif current_time - last_sent_time >= 15:
+                yield f"event: ping\ndata: {json.dumps({'timestamp': current_time})}\n\n"
+                last_sent_time = current_time
+
+            await asyncio.sleep(0.05)
+
+    except asyncio.CancelledError:
+        pass
+    finally:
+        with sessions_lock:
+            if session_id in user_sessions:
+                user_sessions[session_id]['sse_active'] = False
+        print(f"📡 SSE stream ended: {session_id[:8]}")
+
+
+@app.get("/sse/{session_id}")
+async def sse_endpoint(session_id: str):
+    """SSE 엔드포인트 - 추론 결과 실시간 스트리밍 (WebSocket 대안)"""
+    print(f"📡 SSE connected: {session_id[:8]}")
+
+    return StreamingResponse(
+        sse_event_generator(session_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        }
+    )
+
+
+@app.delete("/sse/{session_id}")
+async def close_sse(session_id: str):
+    """SSE 연결 종료"""
+    with sessions_lock:
+        if session_id in user_sessions:
+            user_sessions[session_id]['sse_active'] = False
+            print(f"📡 SSE closed: {session_id[:8]}")
+            return {"status": "closed"}
+    return {"status": "not_found"}
+
+
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     """WebSocket 실시간 통신 - keep-alive 강화"""
@@ -1206,8 +1288,8 @@ if os.path.exists(FRONTEND_DIR):
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
         """SPA fallback - 모든 경로를 index.html로"""
-        # API 경로는 제외
-        if full_path.startswith(("auth/", "driving/", "session/", "ws/", "health", "infer", "result/")):
+        # API 경로는 제외 (sse/ 추가)
+        if full_path.startswith(("auth/", "driving/", "session/", "ws/", "health", "infer", "result/", "sse/")):
             raise HTTPException(status_code=404)
 
         # 정적 파일 확인
