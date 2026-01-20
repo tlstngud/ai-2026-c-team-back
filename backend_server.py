@@ -36,7 +36,7 @@ from dataclasses import dataclass
 
 # 모델 로드
 sys.path.insert(0, '/root/Driver_monitoring')
-from model import DriverBehaviorModel
+from model import BaramNuri
 
 # 클래스 정의
 CLASS_NAMES = {
@@ -232,10 +232,10 @@ def load_model():
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
         print(f"GPU Memory: {gpu_mem:.1f} GB")
 
-    model = DriverBehaviorModel(num_classes=5, pretrained=False)
-    checkpoint = torch.load('/root/Driver_monitoring/pytorch_model.bin',
+    model = BaramNuri(num_classes=5, pretrained=False)
+    checkpoint = torch.load('/root/Driver_monitoring/baramnuri_beta.pth',
                            map_location='cpu', weights_only=True)
-    # 새 형식: {'model': state_dict} / 구 형식: state_dict 직접
+    # BaramNuri 형식: {'model': state_dict, 'epoch': ..., 'optimizer': ..., 'f1': ...}
     state_dict = checkpoint.get('model', checkpoint) if isinstance(checkpoint, dict) else checkpoint
     model.load_state_dict(state_dict)
     model = model.to(device)
